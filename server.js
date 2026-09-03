@@ -58,9 +58,18 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS users (
       email TEXT PRIMARY KEY,
       password TEXT NOT NULL,
+      name TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
   `);
+  // Add `name` to a users table created before this column existed.
+  // SQLite/libSQL has no "ADD COLUMN IF NOT EXISTS", so we try and
+  // swallow the "duplicate column" error on databases that already have it.
+  try {
+    await db.execute('ALTER TABLE users ADD COLUMN name TEXT');
+  } catch (err) {
+    if (!String(err.message || '').includes('duplicate column')) throw err;
+  }
   await db.execute(`
     CREATE TABLE IF NOT EXISTS issues (
       id TEXT PRIMARY KEY,
@@ -84,7 +93,7 @@ async function ensureTables() {
 // stranger with the URL can't create accounts. Call it once per person, then
 // you're done — nothing else needs this header.
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password } = req.body || {};
+  const { email, password, name } = req.body || {};
   if (req.headers['x-setup-key'] !== SETUP_KEY) {
     return res.status(403).json({ error: 'Invalid setup key.' });
   }
@@ -93,8 +102,8 @@ app.post('/api/auth/register', async (req, res) => {
   }
   try {
     await db.execute({
-      sql: 'INSERT INTO users (email, password) VALUES (?, ?)',
-      args: [email.trim().toLowerCase(), password]
+      sql: 'INSERT INTO users (email, password, name) VALUES (?, ?, ?)',
+      args: [email.trim().toLowerCase(), password, name ? name.trim() : null]
     });
     res.json({ ok: true });
   } catch (err) {
@@ -106,6 +115,32 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
+// One-time helper to set/update the display name on an account that was
+// registered before the `name` field existed. Protected by SETUP_KEY, same
+// as /api/auth/register.
+app.post('/api/auth/set-name', async (req, res) => {
+  const { email, name } = req.body || {};
+  if (req.headers['x-setup-key'] !== SETUP_KEY) {
+    return res.status(403).json({ error: 'Invalid setup key.' });
+  }
+  if (!email || !name) {
+    return res.status(400).json({ error: 'email and name are required.' });
+  }
+  try {
+    const result = await db.execute({
+      sql: 'UPDATE users SET name = ? WHERE email = ?',
+      args: [name.trim(), email.trim().toLowerCase()]
+    });
+    if (result.rowsAffected === 0) {
+      return res.status(404).json({ error: 'No user with that email.' });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update name.' });
+  }
+});
+
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
@@ -113,7 +148,7 @@ app.post('/api/auth/login', async (req, res) => {
   }
   try {
     const result = await db.execute({
-      sql: 'SELECT email, password FROM users WHERE email = ?',
+      sql: 'SELECT email, password, name FROM users WHERE email = ?',
       args: [email.trim().toLowerCase()]
     });
     const row = result.rows[0];
@@ -121,7 +156,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Wrong email or password.' });
     }
     const token = issueToken(row.email);
-    res.json({ token, email: row.email });
+    res.json({ token, email: row.email, name: row.name || null });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Login failed.' });
