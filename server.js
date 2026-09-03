@@ -21,9 +21,12 @@ const db = createClient({
   authToken: TURSO_AUTH_TOKEN
 });
 
+const path = require('path');
+
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.static(__dirname));
 
 // ---------- in-memory session store ----------
 // Simple bearer tokens, held in memory only. They reset if the server restarts
