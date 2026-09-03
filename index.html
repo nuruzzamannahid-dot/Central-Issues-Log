@@ -273,7 +273,7 @@
       }
       authToken = data.token;
       authEmail = data.email;
-      $('sessionLabel').textContent = authEmail;
+      $('sessionLabel').textContent = data.name || authEmail;
       $('view-login').style.display = 'none';
       $('view-app').style.display = 'block';
     }catch(err){
