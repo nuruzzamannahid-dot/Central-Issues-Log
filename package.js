@@ -1,0 +1,18 @@
+{
+  "name": "carrybee-escalation-backend",
+  "version": "1.0.0",
+  "description": "Backend for the Carrybee Issue Escalation form — Turso-backed, auto-creates its tables on boot.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.14.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
