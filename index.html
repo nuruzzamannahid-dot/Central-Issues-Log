@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Log an Issue — Carrybee Express</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg: #1C1B18;
+    --surface: #242220;
+    --surface-2: #2E2B26;
+    --border: #3D3A32;
+    --text: #F2EDE4;
+    --text-dim: #ABA495;
+    --text-faint: #766F60;
+    --accent: #E08A3E;
+    --red: #C4544A;
+    --green: #7A9B6E;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;-webkit-font-smoothing:antialiased;}
+  .wrap{max-width:720px;margin:0 auto;padding:28px 20px 80px;}
+  header.top{border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:24px;}
+  .eyebrow{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.04em;color:var(--accent);}
+  h1{font-family:'Fraunces',serif;font-weight:500;font-size:32px;margin:6px 0 0;letter-spacing:-.01em;}
+
+  .form-card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:32px;}
+  .form-card p.lede{color:var(--text-dim);margin:0 0 26px;font-size:14.5px;max-width:60ch;line-height:1.5;}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px 20px;}
+  .field{display:flex;flex-direction:column;gap:7px;}
+  .field.full{grid-column:1 / -1;}
+  label{font-size:12.5px;font-weight:600;color:var(--text-dim);}
+  label .req{color:var(--red);margin-left:2px;}
+  label .hint{display:block;font-weight:400;color:var(--text-faint);font-size:11.5px;margin-top:2px;}
+  input[type=text], select, textarea{
+    background:var(--surface-2);border:1px solid var(--border);color:var(--text);
+    padding:11px 12px;border-radius:8px;font-family:'Inter',sans-serif;font-size:14px;
+    outline:none;transition:border-color .15s ease;width:100%;
+  }
+  input[type=text]:focus, select:focus, textarea:focus{border-color:var(--accent);}
+  select:disabled{opacity:.45;cursor:not-allowed;}
+  textarea{resize:vertical;min-height:90px;line-height:1.5;font-family:'Inter',sans-serif;}
+  select{appearance:none;-webkit-appearance:none;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23ABA495'/%3E%3C/svg%3E");
+    background-repeat:no-repeat;background-position:right 14px center;padding-right:32px;
+  }
+  .submit-row{display:flex;align-items:center;gap:14px;margin-top:28px;}
+  button.primary{
+    background:var(--accent);color:#1C1B18;border:none;font-family:'Inter',sans-serif;
+    font-weight:700;font-size:14.5px;padding:12px 26px;border-radius:8px;cursor:pointer;
+    transition:filter .15s ease;
+  }
+  button.primary:hover{filter:brightness(1.08);}
+  .status-msg{font-size:13.5px;font-weight:600;}
+  .status-msg.ok{color:var(--green);}
+  .status-msg.err{color:var(--red);}
+  .foot-note{margin-top:16px;font-size:12px;color:var(--text-faint);}
+  @media (max-width:640px){ .grid{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <span class="eyebrow">CARRYBEE EXPRESS</span>
+    <h1>Log an Issue</h1>
+  </header>
+
+  <div class="form-card">
+    <p class="lede">Log an operational issue for a consignment or merchant. Submissions here feed the escalation dashboard directly — no separate sync step.</p>
+    <form id="issueForm">
+      <div class="grid">
+
+        <div class="field full">
+          <label>Consignment ID / Merchant Name <span class="req">*</span></label>
+          <input type="text" id="f-consignment" required placeholder="e.g. CB-4471290 or Sundora">
+        </div>
+
+        <div class="field">
+          <label>Channel <span class="req">*</span></label>
+          <select id="f-channel" required>
+            <option value="" disabled selected>Choose</option>
+            <option>KAM</option>
+            <option>Contact center</option>
+            <option>FB</option>
+            <option>OPS</option>
+            <option>HUB</option>
+            <option>Merchant panel</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Zone <span class="req">*</span></label>
+          <select id="f-zone" required>
+            <option value="" disabled selected>Choose</option>
+            <option>ISD</option>
+            <option>OSD</option>
+            <option>RSD</option>
+            <option>Central short</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Hub Name<span class="hint">full hub list coming soon — type for now</span></label>
+          <input type="text" id="f-hub" placeholder="e.g. Uttara Hub">
+        </div>
+
+        <div class="field">
+          <label>Issue Status <span class="req">*</span></label>
+          <select id="f-status" required>
+            <option value="" disabled selected>Choose</option>
+            <option>Open</option>
+            <option>In Progress</option>
+            <option>Escalated</option>
+            <option>Resolved</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Issue Category <span class="req">*</span></label>
+          <select id="f-category" required>
+            <option value="" disabled selected>Choose</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label>Issue Subcategory <span class="req">*</span></label>
+          <select id="f-subcategory" required disabled>
+            <option value="" selected>Choose category first</option>
+          </select>
+        </div>
+
+        <div class="field full">
+          <label>Issue Details <span class="req">*</span></label>
+          <textarea id="f-details" required placeholder="What happened? Include any relevant context the assignee will need."></textarea>
+        </div>
+      </div>
+
+      <div class="submit-row">
+        <button type="submit" class="primary">Log issue</button>
+        <span id="formMsg" class="status-msg"></span>
+      </div>
+    </form>
+    <p class="foot-note">Logged issues appear on the escalation dashboard artifact — open that separately to review, filter, and export.</p>
+  </div>
+</div>
+
+<script>
+  const STORAGE_KEY = 'escalation-issues';
+
+  const CATEGORY_MAP = {
+    "Delivery Delay": ["Hub processing delay","Rider unavailable","Address / location issue","Weather or force majeure","Traffic / distance issue","Customer unreachable","Vehicle breakdown"],
+    "Payment Issue": ["COD not remitted","Payment delay","Wrong amount collected","Payment not updated in system","Bank / transfer issue"],
+    "Pickup": ["Pickup not done","Pickup delay","Rider no-show","Wrong pickup address","Pickup rescheduled without notice"],
+    "Return Delay": ["Return not initiated","Return stuck at hub","Return rider not assigned","Delayed return to merchant"],
+    "Return Exchange": ["Exchange not processed","Wrong item returned","Exchange delay","Customer refused exchange"],
+    "Reverse Pickup": ["Reverse pickup not scheduled","Reverse pickup delay","Rider refused reverse pickup","Customer unavailable for reverse pickup"],
+    "Charge Extra/Wrong COD": ["Extra charge without notice","Wrong COD amount entered","Weight discrepancy charge","Unauthorized charge"],
+    "Damage": ["Product damaged in transit","Packaging damaged","Damage at hub","Damage during handling"],
+    "No Entry/Cancelled": ["Order cancelled by rider","No entry in system","Cancelled without reason","Duplicate entry"],
+    "Unprofessionalism": ["Rider misbehavior","Hub staff misbehavior","Rude communication","Inappropriate conduct"],
+    "Wrong Routing": ["Sent to wrong hub","Wrong zone assignment","Misrouted parcel","Routing system error"],
+    "Wrong Tag/Parcel Swapped": ["Tag mismatch","Parcel swapped with another order","Barcode / label error","Wrong merchant tag"],
+    "Breach of CLOSEBOX": ["Seal broken before delivery","Unauthorized box opening","Tampering reported by customer","Missing items after breach"],
+    "Urgent Delivery": ["Same-day delivery request","VIP / priority merchant request","Time-sensitive product","Festival / peak season request"]
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  const catSelect = $('f-category');
+  Object.keys(CATEGORY_MAP).forEach(cat=>{
+    const o = document.createElement('option');
+    o.value = cat; o.textContent = cat;
+    catSelect.appendChild(o);
+  });
+  catSelect.addEventListener('change', ()=>{
+    const sub = $('f-subcategory');
+    sub.innerHTML = '';
+    const subs = CATEGORY_MAP[catSelect.value] || [];
+    if(subs.length){
+      sub.disabled = false;
+      const ph = document.createElement('option');
+      ph.value=''; ph.disabled=true; ph.selected=true; ph.textContent='Choose';
+      sub.appendChild(ph);
+      subs.forEach(s=>{
+        const o = document.createElement('option'); o.value=s; o.textContent=s;
+        sub.appendChild(o);
+      });
+    } else {
+      sub.disabled = true;
+      const ph = document.createElement('option'); ph.textContent='Choose category first';
+      sub.appendChild(ph);
+    }
+  });
+
+  async function loadIssues(){
+    try{
+      const res = await window.storage.get(STORAGE_KEY, true);
+      if(!res || !res.value) return [];
+      return JSON.parse(res.value);
+    }catch(e){
+      return [];
+    }
+  }
+  async function saveIssues(list){
+    await window.storage.set(STORAGE_KEY, JSON.stringify(list), true);
+  }
+
+  $('issueForm').addEventListener('submit', async (e)=>{
+    e.preventDefault();
+    const msg = $('formMsg');
+    msg.textContent = 'Saving…'; msg.className='status-msg';
+
+    const issue = {
+      id: Date.now() + '-' + Math.random().toString(36).slice(2,7),
+      ts: new Date().toISOString(),
+      consignment: $('f-consignment').value.trim(),
+      channel: $('f-channel').value,
+      zone: $('f-zone').value,
+      hub: $('f-hub').value.trim(),
+      status: $('f-status').value,
+      category: $('f-category').value,
+      subcategory: $('f-subcategory').value,
+      details: $('f-details').value.trim()
+    };
+
+    try{
+      const list = await loadIssues();
+      list.push(issue);
+      await saveIssues(list);
+      msg.textContent = 'Issue logged.'; msg.classList.add('ok');
+      $('issueForm').reset();
+      $('f-subcategory').innerHTML = '<option value="" selected>Choose category first</option>';
+      $('f-subcategory').disabled = true;
+      setTimeout(()=>{ msg.textContent=''; }, 3000);
+    }catch(err){
+      msg.textContent = 'Could not save — try again.'; msg.classList.add('err');
+    }
+  });
+</script>
+</body>
+</html>
