@@ -189,7 +189,12 @@ app.post('/api/issues', requireAuth, async (req, res) => {
 
 app.get('/api/issues', requireAuth, async (req, res) => {
   try {
-    const result = await db.execute('SELECT * FROM issues ORDER BY ts DESC');
+    const result = await db.execute(`
+      SELECT issues.*, COALESCE(users.name, issues.logged_by) AS logged_by_name
+      FROM issues
+      LEFT JOIN users ON users.email = issues.logged_by
+      ORDER BY issues.ts DESC
+    `);
     res.json(result.rows);
   } catch (err) {
     console.error(err);
