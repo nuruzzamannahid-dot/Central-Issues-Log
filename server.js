@@ -85,6 +85,57 @@ async function ensureTables() {
       logged_by TEXT
     )
   `);
+  // Ops/Regional/Cluster remarks + last-updated tracking on existing issues tables.
+  for (const stmt of [
+    'ALTER TABLE issues ADD COLUMN remarks TEXT',
+    'ALTER TABLE issues ADD COLUMN remarks_by TEXT',
+    'ALTER TABLE issues ADD COLUMN updated_at TEXT'
+  ]) {
+    try {
+      await db.execute(stmt);
+    } catch (err) {
+      if (!String(err.message || '').includes('duplicate column')) throw err;
+    }
+  }
+
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS hub_assignments (
+      hub_name TEXT PRIMARY KEY,
+      division TEXT,
+      ops_manager_name TEXT,
+      ops_manager_email TEXT,
+      regional_manager_name TEXT,
+      regional_manager_email TEXT,
+      cluster_lead_name TEXT,
+      cluster_lead_email TEXT
+    )
+  `);
+}
+
+// Given a signed-in email, find every hub they're allowed to see —
+// as Ops Manager, Regional Manager, or Cluster Lead — plus which role(s)
+// gave them access to each. Returns [] if the email is unassigned.
+async function resolveOpsScope(email) {
+  const result = await db.execute({
+    sql: `
+      SELECT hub_name,
+             CASE WHEN ops_manager_email = ?1 THEN 1 ELSE 0 END AS is_ops_manager,
+             CASE WHEN regional_manager_email = ?1 THEN 1 ELSE 0 END AS is_regional_manager,
+             CASE WHEN cluster_lead_email = ?1 THEN 1 ELSE 0 END AS is_cluster_lead
+      FROM hub_assignments
+      WHERE ops_manager_email = ?1 OR regional_manager_email = ?1 OR cluster_lead_email = ?1
+    `,
+    args: [email]
+  });
+  const roles = new Set();
+  const hubs = [];
+  for (const row of result.rows) {
+    hubs.push(row.hub_name);
+    if (row.is_ops_manager) roles.add('ops_manager');
+    if (row.is_regional_manager) roles.add('regional_manager');
+    if (row.is_cluster_lead) roles.add('cluster_lead');
+  }
+  return { roles: [...roles], hubs };
 }
 
 // ---------- auth routes ----------
@@ -203,6 +254,140 @@ app.get('/api/issues', requireAuth, async (req, res) => {
 });
 
 app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+// ---------- admin: seed the hub -> manager mapping ----------
+
+// One-time (or re-run-anytime) bulk upsert of the Hub/Ops-Manager/Regional-
+// Manager/Cluster-Lead mapping. Protected by SETUP_KEY, same convention as
+// /api/auth/register. Body: { rows: [ { hub_name, division, ops_manager_name,
+// ops_manager_email, regional_manager_name, regional_manager_email,
+// cluster_lead_name, cluster_lead_email }, ... ] }
+app.post('/api/admin/import-hubs', async (req, res) => {
+  if (req.headers['x-setup-key'] !== SETUP_KEY) {
+    return res.status(403).json({ error: 'Invalid setup key.' });
+  }
+  const rows = (req.body || {}).rows;
+  if (!Array.isArray(rows) || !rows.length) {
+    return res.status(400).json({ error: 'rows must be a non-empty array.' });
+  }
+  try {
+    for (const r of rows) {
+      await db.execute({
+        sql: `INSERT INTO hub_assignments
+                (hub_name, division, ops_manager_name, ops_manager_email,
+                 regional_manager_name, regional_manager_email,
+                 cluster_lead_name, cluster_lead_email)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(hub_name) DO UPDATE SET
+                division = excluded.division,
+                ops_manager_name = excluded.ops_manager_name,
+                ops_manager_email = excluded.ops_manager_email,
+                regional_manager_name = excluded.regional_manager_name,
+                regional_manager_email = excluded.regional_manager_email,
+                cluster_lead_name = excluded.cluster_lead_name,
+                cluster_lead_email = excluded.cluster_lead_email`,
+        args: [
+          r.hub_name, r.division || null,
+          r.ops_manager_name || null, r.ops_manager_email ? r.ops_manager_email.toLowerCase() : null,
+          r.regional_manager_name || null, r.regional_manager_email ? r.regional_manager_email.toLowerCase() : null,
+          r.cluster_lead_name || null, r.cluster_lead_email ? r.cluster_lead_email.toLowerCase() : null
+        ]
+      });
+    }
+    res.json({ ok: true, imported: rows.length });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Import failed.' });
+  }
+});
+
+// Read-only lookup used by the main dashboard: given a hub name, return the
+// names (not emails) of whoever is assigned so a viewer can see who owns it.
+app.get('/api/hub-assignments/:hub', requireAuth, async (req, res) => {
+  try {
+    const result = await db.execute({
+      sql: `SELECT hub_name, division, ops_manager_name, regional_manager_name, cluster_lead_name
+            FROM hub_assignments WHERE hub_name = ?`,
+      args: [req.params.hub]
+    });
+    res.json(result.rows[0] || null);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not look up hub.' });
+  }
+});
+
+// ---------- ops sub-dashboard routes ----------
+// Ops Manager / Regional Manager / Cluster Lead each see only the issues
+// under the hub(s) hub_assignments says they're responsible for, and can
+// update status + leave a remark, both of which land back in the same
+// `issues` table the main dashboard reads from.
+
+app.get('/api/ops/me', requireAuth, async (req, res) => {
+  try {
+    const scope = await resolveOpsScope(req.user);
+    res.json({ email: req.user, ...scope });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not resolve access.' });
+  }
+});
+
+app.get('/api/ops/issues', requireAuth, async (req, res) => {
+  try {
+    const scope = await resolveOpsScope(req.user);
+    if (!scope.hubs.length) {
+      return res.json([]);
+    }
+    const placeholders = scope.hubs.map(() => '?').join(',');
+    const result = await db.execute({
+      sql: `
+        SELECT issues.*, COALESCE(users.name, issues.logged_by) AS logged_by_name
+        FROM issues
+        LEFT JOIN users ON users.email = issues.logged_by
+        WHERE issues.hub IN (${placeholders})
+        ORDER BY issues.ts DESC
+      `,
+      args: scope.hubs
+    });
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not fetch issues.' });
+  }
+});
+
+app.patch('/api/ops/issues/:id', requireAuth, async (req, res) => {
+  const { status, remarks } = req.body || {};
+  if (!status) {
+    return res.status(400).json({ error: 'status is required.' });
+  }
+  try {
+    const scope = await resolveOpsScope(req.user);
+    if (!scope.hubs.length) {
+      return res.status(403).json({ error: 'You are not assigned to any hub.' });
+    }
+    const existing = await db.execute({
+      sql: 'SELECT hub FROM issues WHERE id = ?',
+      args: [req.params.id]
+    });
+    const issue = existing.rows[0];
+    if (!issue) {
+      return res.status(404).json({ error: 'Issue not found.' });
+    }
+    if (!scope.hubs.includes(issue.hub)) {
+      return res.status(403).json({ error: 'This issue is outside your assigned hubs.' });
+    }
+    await db.execute({
+      sql: `UPDATE issues SET status = ?, remarks = ?, remarks_by = ?, updated_at = ? WHERE id = ?`,
+      args: [status, remarks || null, req.user, new Date().toISOString(), req.params.id]
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not update issue.' });
+  }
+});
 
 ensureTables()
   .then(() => {
