@@ -70,6 +70,14 @@ async function ensureTables() {
   } catch (err) {
     if (!String(err.message || '').includes('duplicate column')) throw err;
   }
+  // Which app this login is allowed to use: 'main' (Central Issues Log +
+  // Escalation Dashboard) or 'ops' (Ops Console). NULL is treated as 'main'
+  // for accounts created before this column existed.
+  try {
+    await db.execute('ALTER TABLE users ADD COLUMN app_access TEXT');
+  } catch (err) {
+    if (!String(err.message || '').includes('duplicate column')) throw err;
+  }
   await db.execute(`
     CREATE TABLE IF NOT EXISTS issues (
       id TEXT PRIMARY KEY,
@@ -144,7 +152,7 @@ async function resolveOpsScope(email) {
 // stranger with the URL can't create accounts. Call it once per person, then
 // you're done — nothing else needs this header.
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, name } = req.body || {};
+  const { email, password, name, app: appAccess } = req.body || {};
   if (req.headers['x-setup-key'] !== SETUP_KEY) {
     return res.status(403).json({ error: 'Invalid setup key.' });
   }
@@ -153,8 +161,8 @@ app.post('/api/auth/register', async (req, res) => {
   }
   try {
     await db.execute({
-      sql: 'INSERT INTO users (email, password, name) VALUES (?, ?, ?)',
-      args: [email.trim().toLowerCase(), password, name ? name.trim() : null]
+      sql: 'INSERT INTO users (email, password, name, app_access) VALUES (?, ?, ?, ?)',
+      args: [email.trim().toLowerCase(), password, name ? name.trim() : null, appAccess === 'ops' ? 'ops' : 'main']
     });
     res.json({ ok: true });
   } catch (err) {
@@ -192,19 +200,57 @@ app.post('/api/auth/set-name', async (req, res) => {
   }
 });
 
+// Bulk-create Ops Console logins in one call. Protected by SETUP_KEY. Body:
+// { rows: [ { email, name }, ... ], password?, app? }. Defaults: password
+// '0000', app 'ops'. Skips any email that's already registered — safe to
+// re-run without clobbering a password someone has since changed.
+app.post('/api/admin/bulk-register', async (req, res) => {
+  if (req.headers['x-setup-key'] !== SETUP_KEY) {
+    return res.status(403).json({ error: 'Invalid setup key.' });
+  }
+  const { rows, password, app: appAccess } = req.body || {};
+  if (!Array.isArray(rows) || !rows.length) {
+    return res.status(400).json({ error: 'rows must be a non-empty array.' });
+  }
+  const pw = password || '0000';
+  const appVal = appAccess === 'main' ? 'main' : 'ops';
+  let created = 0, skipped = 0;
+  try {
+    for (const r of rows) {
+      if (!r.email) continue;
+      const result = await db.execute({
+        sql: `INSERT INTO users (email, password, name, app_access)
+              VALUES (?, ?, ?, ?)
+              ON CONFLICT(email) DO NOTHING`,
+        args: [r.email.trim().toLowerCase(), pw, r.name ? r.name.trim() : null, appVal]
+      });
+      if (result.rowsAffected > 0) created++; else skipped++;
+    }
+    res.json({ ok: true, created, skipped });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Bulk register failed.' });
+  }
+});
+
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body || {};
+  const { email, password, app: appAccess } = req.body || {};
   if (!email || !password) {
     return res.status(400).json({ error: 'email and password are required.' });
   }
   try {
     const result = await db.execute({
-      sql: 'SELECT email, password, name FROM users WHERE email = ?',
+      sql: 'SELECT email, password, name, app_access FROM users WHERE email = ?',
       args: [email.trim().toLowerCase()]
     });
     const row = result.rows[0];
     if (!row || row.password !== password) {
       return res.status(401).json({ error: 'Wrong email or password.' });
+    }
+    const effectiveApp = row.app_access || 'main';
+    const requestedApp = appAccess === 'ops' ? 'ops' : 'main';
+    if (effectiveApp !== requestedApp) {
+      return res.status(403).json({ error: 'This login is not authorized for this dashboard.' });
     }
     const token = issueToken(row.email);
     res.json({ token, email: row.email, name: row.name || null });
