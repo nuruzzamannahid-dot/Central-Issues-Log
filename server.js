@@ -97,7 +97,8 @@ async function ensureTables() {
   for (const stmt of [
     'ALTER TABLE issues ADD COLUMN remarks TEXT',
     'ALTER TABLE issues ADD COLUMN remarks_by TEXT',
-    'ALTER TABLE issues ADD COLUMN updated_at TEXT'
+    'ALTER TABLE issues ADD COLUMN updated_at TEXT',
+    'ALTER TABLE issues ADD COLUMN media TEXT'
   ]) {
     try {
       await db.execute(stmt);
@@ -265,6 +266,9 @@ app.post('/api/auth/login', async (req, res) => {
 app.post('/api/issues', requireAuth, async (req, res) => {
   const i = req.body || {};
   const required = ['consignment', 'channel', 'zone', 'hub', 'status', 'category', 'subcategory', 'details'];
+  if (['Social Media', 'Inbound'].includes(i.channel)) {
+    required.push('media');
+  }
   const missing = required.filter(k => !i[k]);
   if (missing.length) {
     return res.status(400).json({ error: `Missing fields: ${missing.join(', ')}` });
@@ -273,9 +277,9 @@ app.post('/api/issues', requireAuth, async (req, res) => {
   const ts = new Date().toISOString();
   try {
     await db.execute({
-      sql: `INSERT INTO issues (id, ts, consignment, channel, zone, hub, status, category, subcategory, details, logged_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      args: [id, ts, i.consignment, i.channel, i.zone, i.hub, i.status, i.category, i.subcategory, i.details, req.user]
+      sql: `INSERT INTO issues (id, ts, consignment, channel, media, zone, hub, status, category, subcategory, details, logged_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      args: [id, ts, i.consignment, i.channel, i.media || null, i.zone, i.hub, i.status, i.category, i.subcategory, i.details, req.user]
     });
     res.json({ ok: true, id, ts });
   } catch (err) {
