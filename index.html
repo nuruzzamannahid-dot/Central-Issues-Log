@@ -112,10 +112,20 @@
             <option value="" disabled selected>Choose</option>
             <option>KAM</option>
             <option>Contact center</option>
-            <option>FB</option>
+            <option>Social Media</option>
+            <option>Inbound</option>
             <option>OPS</option>
             <option>HUB</option>
             <option>Merchant panel</option>
+          </select>
+        </div>
+
+        <div class="field" id="field-media" style="display:none;">
+          <label>Media <span class="req">*</span></label>
+          <select id="f-media">
+            <option value="" disabled selected>Choose</option>
+            <option>Customer</option>
+            <option>Merchant</option>
           </select>
         </div>
 
@@ -204,6 +214,21 @@
   };
 
   const $ = (id) => document.getElementById(id);
+
+  const MEDIA_CHANNELS = ['Social Media', 'Inbound'];
+  const channelSelect = $('f-channel');
+  const mediaField = $('field-media');
+  const mediaSelect = $('f-media');
+  channelSelect.addEventListener('change', ()=>{
+    if(MEDIA_CHANNELS.includes(channelSelect.value)){
+      mediaField.style.display = '';
+      mediaSelect.required = true;
+    } else {
+      mediaField.style.display = 'none';
+      mediaSelect.required = false;
+      mediaSelect.value = '';
+    }
+  });
 
   const zoneSelect = $('f-zone');
   zoneSelect.addEventListener('change', ()=>{
@@ -296,6 +321,7 @@
     const issue = {
       consignment: $('f-consignment').value.trim(),
       channel: $('f-channel').value,
+      media: MEDIA_CHANNELS.includes($('f-channel').value) ? $('f-media').value : '',
       zone: $('f-zone').value,
       hub: $('f-hub').value.trim(),
       status: $('f-status').value,
@@ -329,6 +355,8 @@
       $('f-hub').disabled = true;
       $('f-subcategory').innerHTML = '<option value="" selected>Choose category first</option>';
       $('f-subcategory').disabled = true;
+      mediaField.style.display = 'none';
+      mediaSelect.required = false;
       setTimeout(()=>{ msg.textContent=''; }, 3000);
     }catch(err){
       msg.textContent = 'Could not reach the server — try again.'; msg.classList.add('err');
