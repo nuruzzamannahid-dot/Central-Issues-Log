@@ -41,6 +41,11 @@
   }
   input[type=text]:focus, select:focus, textarea:focus{border-color:var(--accent);}
   select:disabled{opacity:.45;cursor:not-allowed;}
+  .checkbox-box{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:14px 14px 6px;}
+  .checkbox-group-title{font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.04em;color:var(--text-faint);text-transform:uppercase;margin:0 0 6px;}
+  .checkbox-group-title:not(:first-child){margin-top:12px;}
+  .checkbox-item{display:flex;align-items:center;gap:9px;font-size:13.5px;color:var(--text);font-weight:400;padding:6px 2px;cursor:pointer;}
+  .checkbox-item input{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;flex:none;}
   textarea{resize:vertical;min-height:90px;line-height:1.5;font-family:'Inter',sans-serif;}
   select{appearance:none;-webkit-appearance:none;
     background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23ABA495'/%3E%3C/svg%3E");
@@ -127,6 +132,19 @@
             <option>Customer</option>
             <option>Merchant</option>
           </select>
+        </div>
+
+        <div class="field full" id="field-social-source" style="display:none;">
+          <label>Social Media Source <span class="req">*</span></label>
+          <div class="checkbox-box">
+            <div class="checkbox-group-title">Groups</div>
+            <label class="checkbox-item"><input type="checkbox" class="social-source-opt" value="CarryBee Agent Community [Official]"> CarryBee Agent Community [Official]</label>
+            <label class="checkbox-item"><input type="checkbox" class="social-source-opt" value="CarryBee - Merchant Support [Official]"> CarryBee - Merchant Support [Official]</label>
+            <label class="checkbox-item"><input type="checkbox" class="social-source-opt" value="CarryBee Community [Official]"> CarryBee Community [Official]</label>
+            <div class="checkbox-group-title">Pages</div>
+            <label class="checkbox-item"><input type="checkbox" class="social-source-opt" value="CarryBee"> CarryBee</label>
+            <label class="checkbox-item"><input type="checkbox" class="social-source-opt" value="CarryBee Careers"> CarryBee Careers</label>
+          </div>
         </div>
 
         <div class="field">
@@ -219,6 +237,15 @@
   const channelSelect = $('f-channel');
   const mediaField = $('field-media');
   const mediaSelect = $('f-media');
+  const socialSourceField = $('field-social-source');
+  const socialSourceBoxes = document.querySelectorAll('.social-source-opt');
+  function resetSocialSource(){
+    socialSourceField.style.display = 'none';
+    socialSourceBoxes.forEach(cb => { cb.checked = false; });
+  }
+  function getSocialSource(){
+    return Array.from(socialSourceBoxes).filter(cb => cb.checked).map(cb => cb.value);
+  }
   channelSelect.addEventListener('change', ()=>{
     if(MEDIA_CHANNELS.includes(channelSelect.value)){
       mediaField.style.display = '';
@@ -227,6 +254,11 @@
       mediaField.style.display = 'none';
       mediaSelect.required = false;
       mediaSelect.value = '';
+    }
+    if(channelSelect.value === 'Social Media'){
+      socialSourceField.style.display = '';
+    } else {
+      resetSocialSource();
     }
   });
 
@@ -316,12 +348,19 @@
   $('issueForm').addEventListener('submit', async (e)=>{
     e.preventDefault();
     const msg = $('formMsg');
+
+    if(channelSelect.value === 'Social Media' && getSocialSource().length === 0){
+      msg.textContent = 'Select at least one Social Media source.'; msg.className='status-msg err';
+      return;
+    }
+
     msg.textContent = 'Saving…'; msg.className='status-msg';
 
     const issue = {
       consignment: $('f-consignment').value.trim(),
       channel: $('f-channel').value,
       media: MEDIA_CHANNELS.includes($('f-channel').value) ? $('f-media').value : '',
+      socialSource: channelSelect.value === 'Social Media' ? getSocialSource().join(', ') : '',
       zone: $('f-zone').value,
       hub: $('f-hub').value.trim(),
       status: $('f-status').value,
@@ -357,6 +396,7 @@
       $('f-subcategory').disabled = true;
       mediaField.style.display = 'none';
       mediaSelect.required = false;
+      resetSocialSource();
       setTimeout(()=>{ msg.textContent=''; }, 3000);
     }catch(err){
       msg.textContent = 'Could not reach the server — try again.'; msg.classList.add('err');
