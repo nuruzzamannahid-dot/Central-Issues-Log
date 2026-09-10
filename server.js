@@ -2,13 +2,24 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const crypto = require('crypto');
+const cron = require('node-cron');
+const nodemailer = require('nodemailer');
 const { createClient } = require('@libsql/client');
 
 const {
   TURSO_DATABASE_URL,
   TURSO_AUTH_TOKEN,
   SETUP_KEY,      // required header value to create new login users via /api/auth/register
-  PORT = 3000
+  PORT = 3000,
+  SMTP_HOST,
+  SMTP_PORT = 587,
+  SMTP_SECURE = 'false',
+  SMTP_USER,
+  SMTP_PASS,
+  MAIL_FROM,
+  DAILY_REPORT_CRON = '59 23 * * *',
+  DAILY_REPORT_TZ = 'Asia/Dhaka',
+  DAILY_REPORT_ENABLED = 'true'
 } = process.env;
 
 if (!TURSO_DATABASE_URL || !TURSO_AUTH_TOKEN) {
@@ -440,6 +451,245 @@ app.patch('/api/ops/issues/:id', requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not update issue.' });
+  }
+});
+
+// ---------- daily pending-issues email report ----------
+// Every day, Cluster Leads get the pending issues under their own hub,
+// Regional Managers get pending issues across every hub under them, and
+// Ops Managers get the company-wide pending total — all pulled straight
+// from `hub_assignments`, the same mapping /api/ops/me already relies on.
+
+const PENDING_STATUSES = ['Open', 'In Progress', 'Escalated'];
+
+let mailer = null;
+function getMailer() {
+  if (mailer) return mailer;
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) return null;
+  mailer = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: Number(SMTP_PORT),
+    secure: String(SMTP_SECURE).toLowerCase() === 'true',
+    auth: { user: SMTP_USER, pass: SMTP_PASS }
+  });
+  return mailer;
+}
+
+async function fetchPendingIssues() {
+  const placeholders = PENDING_STATUSES.map(() => '?').join(',');
+  const result = await db.execute({
+    sql: `SELECT id, consignment, hub, zone, status, ts FROM issues
+          WHERE status IN (${placeholders})
+          ORDER BY hub, ts DESC`,
+    args: PENDING_STATUSES
+  });
+  return result.rows;
+}
+
+async function fetchHubAssignments() {
+  const result = await db.execute('SELECT * FROM hub_assignments');
+  return result.rows;
+}
+
+// Builds one digest per recipient: { email, name, roleLabel, scopeLabel, issues }
+async function buildDailyDigests() {
+  const [pending, hubRows] = await Promise.all([fetchPendingIssues(), fetchHubAssignments()]);
+
+  const hubInfo = new Map();
+  const opsManagers = new Map();      // email -> name
+  const regionalManagers = new Map(); // email -> { name, hubs:Set }
+  const clusterLeads = new Map();     // email -> { name, hubs:Set }
+
+  for (const r of hubRows) {
+    hubInfo.set(r.hub_name, r);
+    if (r.ops_manager_email) opsManagers.set(r.ops_manager_email, r.ops_manager_name || r.ops_manager_email);
+    if (r.regional_manager_email) {
+      if (!regionalManagers.has(r.regional_manager_email)) {
+        regionalManagers.set(r.regional_manager_email, { name: r.regional_manager_name || r.regional_manager_email, hubs: new Set() });
+      }
+      regionalManagers.get(r.regional_manager_email).hubs.add(r.hub_name);
+    }
+    if (r.cluster_lead_email) {
+      if (!clusterLeads.has(r.cluster_lead_email)) {
+        clusterLeads.set(r.cluster_lead_email, { name: r.cluster_lead_name || r.cluster_lead_email, hubs: new Set() });
+      }
+      clusterLeads.get(r.cluster_lead_email).hubs.add(r.hub_name);
+    }
+  }
+
+  const clusterLeadIssues = new Map();   // email -> issues[]
+  const regionalManagerIssues = new Map(); // email -> issues[]
+
+  for (const issue of pending) {
+    const info = hubInfo.get(issue.hub);
+    if (!info) continue;
+    if (info.cluster_lead_email) {
+      if (!clusterLeadIssues.has(info.cluster_lead_email)) clusterLeadIssues.set(info.cluster_lead_email, []);
+      clusterLeadIssues.get(info.cluster_lead_email).push(issue);
+    }
+    if (info.regional_manager_email) {
+      if (!regionalManagerIssues.has(info.regional_manager_email)) regionalManagerIssues.set(info.regional_manager_email, []);
+      regionalManagerIssues.get(info.regional_manager_email).push(issue);
+    }
+  }
+
+  const digests = [];
+
+  for (const [email, { name, hubs }] of clusterLeads) {
+    digests.push({
+      email, name, roleLabel: 'Cluster Lead',
+      scopeLabel: [...hubs].join(', ') || 'your hub',
+      issues: clusterLeadIssues.get(email) || []
+    });
+  }
+
+  for (const [email, { name, hubs }] of regionalManagers) {
+    digests.push({
+      email, name, roleLabel: 'Regional Manager',
+      scopeLabel: [...hubs].join(', ') || 'your hubs',
+      issues: regionalManagerIssues.get(email) || []
+    });
+  }
+
+  for (const [email, name] of opsManagers) {
+    digests.push({
+      email, name, roleLabel: 'Ops Manager',
+      scopeLabel: 'All hubs (company-wide)',
+      issues: pending // Ops Manager gets the overall, company-wide pending list
+    });
+  }
+
+  return digests;
+}
+
+function fmtDhakaTime(iso) {
+  if (!iso) return '';
+  try {
+    return new Date(iso).toLocaleString('en-GB', {
+      timeZone: 'Asia/Dhaka', day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit'
+    });
+  } catch {
+    return iso;
+  }
+}
+
+function escapeHtmlMail(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function renderDigestHtml(digest, todayLabel) {
+  const grouped = new Map();
+  for (const i of digest.issues) {
+    if (!grouped.has(i.hub)) grouped.set(i.hub, []);
+    grouped.get(i.hub).push(i);
+  }
+  const hubSections = [...grouped.entries()].map(([hub, issues]) => `
+    <p style="margin:18px 0 6px;font-family:Arial,sans-serif;font-size:14px;font-weight:bold;color:#1C1B18;">${escapeHtmlMail(hub)} — ${issues.length} pending</p>
+    <table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;">
+      <thead>
+        <tr style="background:#f0efec;text-align:left;">
+          <th style="padding:8px;border:1px solid #ddd;">Consignment ID</th>
+          <th style="padding:8px;border:1px solid #ddd;">Status</th>
+          <th style="padding:8px;border:1px solid #ddd;">Logged</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${issues.map(i => `
+          <tr>
+            <td style="padding:8px;border:1px solid #ddd;">${escapeHtmlMail(i.consignment || i.id)}</td>
+            <td style="padding:8px;border:1px solid #ddd;">${escapeHtmlMail(i.status)}</td>
+            <td style="padding:8px;border:1px solid #ddd;">${fmtDhakaTime(i.ts)}</td>
+          </tr>`).join('')}
+      </tbody>
+    </table>
+  `).join('');
+
+  return `
+    <div style="font-family:Arial,sans-serif;color:#1C1B18;max-width:640px;">
+      <p>Dear ${escapeHtmlMail(digest.name)},</p>
+      <p>Please find below the daily pending issues report for <b>${todayLabel}</b>.</p>
+      <p><b>Role:</b> ${escapeHtmlMail(digest.roleLabel)}<br>
+         <b>Scope:</b> ${escapeHtmlMail(digest.scopeLabel)}<br>
+         <b>Total pending issues:</b> ${digest.issues.length}</p>
+      ${digest.issues.length ? hubSections : '<p>There are currently no pending issues in your scope. Good work.</p>'}
+      <p style="margin-top:22px;">Kindly review and take the necessary action at your earliest convenience.</p>
+      <p>Regards,<br>Carrybee Ops Console (automated report)</p>
+    </div>
+  `;
+}
+
+function renderDigestText(digest, todayLabel) {
+  const lines = [];
+  lines.push(`Dear ${digest.name},`, '');
+  lines.push(`Daily pending issues report for ${todayLabel}.`);
+  lines.push(`Role: ${digest.roleLabel}`);
+  lines.push(`Scope: ${digest.scopeLabel}`);
+  lines.push(`Total pending issues: ${digest.issues.length}`, '');
+  if (!digest.issues.length) {
+    lines.push('There are currently no pending issues in your scope. Good work.');
+  } else {
+    const grouped = new Map();
+    for (const i of digest.issues) {
+      if (!grouped.has(i.hub)) grouped.set(i.hub, []);
+      grouped.get(i.hub).push(i);
+    }
+    for (const [hub, issues] of grouped) {
+      lines.push(`${hub} — ${issues.length} pending:`);
+      for (const i of issues) lines.push(`  - ${i.consignment || i.id} (${i.status}, logged ${fmtDhakaTime(i.ts)})`);
+      lines.push('');
+    }
+  }
+  lines.push('Kindly review and take the necessary action at your earliest convenience.', '', 'Regards,', 'Carrybee Ops Console (automated report)');
+  return lines.join('\n');
+}
+
+async function sendDailyReports() {
+  const transport = getMailer();
+  if (!transport) {
+    console.warn('Daily report skipped: SMTP_HOST/SMTP_USER/SMTP_PASS are not configured.');
+    return { sent: 0, skipped: true };
+  }
+  const todayLabel = new Date().toLocaleDateString('en-GB', { timeZone: DAILY_REPORT_TZ, day: '2-digit', month: 'long', year: 'numeric' });
+  const digests = await buildDailyDigests();
+  let sent = 0;
+  for (const digest of digests) {
+    try {
+      await transport.sendMail({
+        from: MAIL_FROM || SMTP_USER,
+        to: digest.email,
+        subject: `Daily Pending Issues Report – ${todayLabel} – ${digest.roleLabel} – ${digest.issues.length} pending`,
+        text: renderDigestText(digest, todayLabel),
+        html: renderDigestHtml(digest, todayLabel)
+      });
+      sent++;
+    } catch (err) {
+      console.error(`Failed to send daily report to ${digest.email}:`, err);
+    }
+  }
+  console.log(`Daily pending-issues report: sent ${sent}/${digests.length}.`);
+  return { sent, total: digests.length };
+}
+
+if (String(DAILY_REPORT_ENABLED).toLowerCase() === 'true') {
+  cron.schedule(DAILY_REPORT_CRON, () => {
+    sendDailyReports().catch(err => console.error('Daily report job failed:', err));
+  }, { timezone: DAILY_REPORT_TZ });
+  console.log(`Daily pending-issues report scheduled: "${DAILY_REPORT_CRON}" (${DAILY_REPORT_TZ}).`);
+}
+
+// Manual trigger for testing, or for an external cron service (e.g. a Render
+// Cron Job, or cron-job.org) to hit instead of relying on node-cron staying
+// resident — useful if this service can spin down on an inactivity timeout.
+app.post('/api/admin/send-daily-report', async (req, res) => {
+  if (req.headers['x-setup-key'] !== SETUP_KEY) {
+    return res.status(403).json({ error: 'Invalid setup key.' });
+  }
+  try {
+    const result = await sendDailyReports();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not send daily report.' });
   }
 });
 
