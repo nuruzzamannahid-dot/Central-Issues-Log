@@ -123,6 +123,7 @@ async function ensureTables() {
     CREATE TABLE IF NOT EXISTS hub_assignments (
       hub_name TEXT PRIMARY KEY,
       division TEXT,
+      hub_email TEXT,
       ops_manager_name TEXT,
       ops_manager_email TEXT,
       regional_manager_name TEXT,
@@ -131,20 +132,28 @@ async function ensureTables() {
       cluster_lead_email TEXT
     )
   `);
+  // Add `hub_email` to a hub_assignments table created before this column
+  // existed (the hub's own login — sees only its own hub, below Cluster Lead).
+  try {
+    await db.execute('ALTER TABLE hub_assignments ADD COLUMN hub_email TEXT');
+  } catch (err) {
+    if (!String(err.message || '').includes('duplicate column')) throw err;
+  }
 }
 
 // Given a signed-in email, find every hub they're allowed to see —
-// as Ops Manager, Regional Manager, or Cluster Lead — plus which role(s)
-// gave them access to each. Returns [] if the email is unassigned.
+// as the Hub's own login, Cluster Lead, Regional Manager, or Ops Manager —
+// plus which role(s) gave them access to each. Returns [] if unassigned.
 async function resolveOpsScope(email) {
   const result = await db.execute({
     sql: `
       SELECT hub_name,
+             CASE WHEN hub_email = ?1 THEN 1 ELSE 0 END AS is_hub,
              CASE WHEN ops_manager_email = ?1 THEN 1 ELSE 0 END AS is_ops_manager,
              CASE WHEN regional_manager_email = ?1 THEN 1 ELSE 0 END AS is_regional_manager,
              CASE WHEN cluster_lead_email = ?1 THEN 1 ELSE 0 END AS is_cluster_lead
       FROM hub_assignments
-      WHERE ops_manager_email = ?1 OR regional_manager_email = ?1 OR cluster_lead_email = ?1
+      WHERE hub_email = ?1 OR ops_manager_email = ?1 OR regional_manager_email = ?1 OR cluster_lead_email = ?1
     `,
     args: [email]
   });
@@ -152,6 +161,7 @@ async function resolveOpsScope(email) {
   const hubs = [];
   for (const row of result.rows) {
     hubs.push(row.hub_name);
+    if (row.is_hub) roles.add('hub');
     if (row.is_ops_manager) roles.add('ops_manager');
     if (row.is_regional_manager) roles.add('regional_manager');
     if (row.is_cluster_lead) roles.add('cluster_lead');
@@ -339,20 +349,21 @@ app.post('/api/admin/import-hubs', async (req, res) => {
     for (const r of rows) {
       await db.execute({
         sql: `INSERT INTO hub_assignments
-                (hub_name, division, ops_manager_name, ops_manager_email,
+                (hub_name, division, hub_email, ops_manager_name, ops_manager_email,
                  regional_manager_name, regional_manager_email,
                  cluster_lead_name, cluster_lead_email)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
               ON CONFLICT(hub_name) DO UPDATE SET
-                division = excluded.division,
-                ops_manager_name = excluded.ops_manager_name,
-                ops_manager_email = excluded.ops_manager_email,
-                regional_manager_name = excluded.regional_manager_name,
-                regional_manager_email = excluded.regional_manager_email,
-                cluster_lead_name = excluded.cluster_lead_name,
-                cluster_lead_email = excluded.cluster_lead_email`,
+                division = COALESCE(excluded.division, hub_assignments.division),
+                hub_email = COALESCE(excluded.hub_email, hub_assignments.hub_email),
+                ops_manager_name = COALESCE(excluded.ops_manager_name, hub_assignments.ops_manager_name),
+                ops_manager_email = COALESCE(excluded.ops_manager_email, hub_assignments.ops_manager_email),
+                regional_manager_name = COALESCE(excluded.regional_manager_name, hub_assignments.regional_manager_name),
+                regional_manager_email = COALESCE(excluded.regional_manager_email, hub_assignments.regional_manager_email),
+                cluster_lead_name = COALESCE(excluded.cluster_lead_name, hub_assignments.cluster_lead_name),
+                cluster_lead_email = COALESCE(excluded.cluster_lead_email, hub_assignments.cluster_lead_email)`,
         args: [
-          r.hub_name, r.division || null,
+          r.hub_name, r.division || null, r.hub_email ? r.hub_email.toLowerCase() : null,
           r.ops_manager_name || null, r.ops_manager_email ? r.ops_manager_email.toLowerCase() : null,
           r.regional_manager_name || null, r.regional_manager_email ? r.regional_manager_email.toLowerCase() : null,
           r.cluster_lead_name || null, r.cluster_lead_email ? r.cluster_lead_email.toLowerCase() : null
@@ -371,7 +382,7 @@ app.post('/api/admin/import-hubs', async (req, res) => {
 app.get('/api/hub-assignments/:hub', requireAuth, async (req, res) => {
   try {
     const result = await db.execute({
-      sql: `SELECT hub_name, division, ops_manager_name, regional_manager_name, cluster_lead_name
+      sql: `SELECT hub_name, division, hub_email, ops_manager_name, regional_manager_name, cluster_lead_name
             FROM hub_assignments WHERE hub_name = ?`,
       args: [req.params.hub]
     });
@@ -496,12 +507,14 @@ async function buildDailyDigests() {
   const [pending, hubRows] = await Promise.all([fetchPendingIssues(), fetchHubAssignments()]);
 
   const hubInfo = new Map();
+  const hubLogins = new Map();        // email -> hub_name (a hub login only ever covers its own hub)
   const opsManagers = new Map();      // email -> name
   const regionalManagers = new Map(); // email -> { name, hubs:Set }
   const clusterLeads = new Map();     // email -> { name, hubs:Set }
 
   for (const r of hubRows) {
     hubInfo.set(r.hub_name, r);
+    if (r.hub_email) hubLogins.set(r.hub_email, r.hub_name);
     if (r.ops_manager_email) opsManagers.set(r.ops_manager_email, r.ops_manager_name || r.ops_manager_email);
     if (r.regional_manager_email) {
       if (!regionalManagers.has(r.regional_manager_email)) {
@@ -517,12 +530,17 @@ async function buildDailyDigests() {
     }
   }
 
+  const hubIssues = new Map();           // email -> issues[] (that hub's own login)
   const clusterLeadIssues = new Map();   // email -> issues[]
   const regionalManagerIssues = new Map(); // email -> issues[]
 
   for (const issue of pending) {
     const info = hubInfo.get(issue.hub);
     if (!info) continue;
+    if (info.hub_email) {
+      if (!hubIssues.has(info.hub_email)) hubIssues.set(info.hub_email, []);
+      hubIssues.get(info.hub_email).push(issue);
+    }
     if (info.cluster_lead_email) {
       if (!clusterLeadIssues.has(info.cluster_lead_email)) clusterLeadIssues.set(info.cluster_lead_email, []);
       clusterLeadIssues.get(info.cluster_lead_email).push(issue);
@@ -534,6 +552,14 @@ async function buildDailyDigests() {
   }
 
   const digests = [];
+
+  for (const [email, hubName] of hubLogins) {
+    digests.push({
+      email, name: hubName, roleLabel: 'Hub',
+      scopeLabel: hubName,
+      issues: hubIssues.get(email) || []
+    });
+  }
 
   for (const [email, { name, hubs }] of clusterLeads) {
     digests.push({
