@@ -110,7 +110,12 @@ async function ensureTables() {
     'ALTER TABLE issues ADD COLUMN remarks_by TEXT',
     'ALTER TABLE issues ADD COLUMN updated_at TEXT',
     'ALTER TABLE issues ADD COLUMN media TEXT',
-    'ALTER TABLE issues ADD COLUMN social_source TEXT'
+    'ALTER TABLE issues ADD COLUMN social_source TEXT',
+    // Time-based escalation ladder: L3 (Hub) -> L2 (Cluster/Regional) -> L1 (Ops Manager).
+    "ALTER TABLE issues ADD COLUMN escalation_level TEXT DEFAULT 'L3'",
+    "ALTER TABLE issues ADD COLUMN response_status TEXT DEFAULT 'Regular'",
+    'ALTER TABLE issues ADD COLUMN level_started_at TEXT',
+    'ALTER TABLE issues ADD COLUMN merchant_notified_at TEXT'
   ]) {
     try {
       await db.execute(stmt);
@@ -118,6 +123,10 @@ async function ensureTables() {
       if (!String(err.message || '').includes('duplicate column')) throw err;
     }
   }
+  // Issues created before level_started_at existed have it as NULL, and the
+  // escalation sweep skips any row with no level_started_at — without this,
+  // every pre-existing open issue would sit outside the ladder forever.
+  await db.execute(`UPDATE issues SET level_started_at = ts WHERE level_started_at IS NULL`);
 
   await db.execute(`
     CREATE TABLE IF NOT EXISTS hub_assignments (
@@ -285,6 +294,17 @@ app.post('/api/auth/login', async (req, res) => {
 
 // ---------- issue routes ----------
 
+// Sends the initial "your issue has been escalated" message to the merchant.
+// STUB: no merchant contact field exists on `issues` yet and no SMS/WhatsApp/
+// email gateway is wired up, so this only records that the attempt happened.
+// Once there's a merchant phone/email source (a new field at raise-time, or a
+// lookup by consignment ID against another system), replace the body of this
+// function with the real send and it'll be called from the same place.
+async function notifyMerchant(issue) {
+  console.log(`[merchant-notify] would message merchant for consignment ${issue.consignment} (issue ${issue.id}) — no gateway configured yet.`);
+  return true;
+}
+
 app.post('/api/issues', requireAuth, async (req, res) => {
   const i = req.body || {};
   const required = ['consignment', 'channel', 'zone', 'hub', 'status', 'category', 'subcategory', 'details'];
@@ -302,10 +322,17 @@ app.post('/api/issues', requireAuth, async (req, res) => {
   const ts = new Date().toISOString();
   try {
     await db.execute({
-      sql: `INSERT INTO issues (id, ts, consignment, channel, media, social_source, zone, hub, status, category, subcategory, details, logged_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      args: [id, ts, i.consignment, i.channel, i.media || null, i.socialSource || null, i.zone, i.hub, i.status, i.category, i.subcategory, i.details, req.user]
+      sql: `INSERT INTO issues
+              (id, ts, consignment, channel, media, social_source, zone, hub, status, category, subcategory, details, logged_by,
+               escalation_level, response_status, level_started_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'L3', 'Regular', ?)`,
+      args: [id, ts, i.consignment, i.channel, i.media || null, i.socialSource || null, i.zone, i.hub, i.status, i.category, i.subcategory, i.details, req.user, ts]
     });
+    notifyMerchant({ id, consignment: i.consignment }).then(async ok => {
+      if (ok) {
+        await db.execute({ sql: 'UPDATE issues SET merchant_notified_at = ? WHERE id = ?', args: [new Date().toISOString(), id] });
+      }
+    }).catch(err => console.error('notifyMerchant failed:', err));
     res.json({ ok: true, id, ts });
   } catch (err) {
     console.error(err);
@@ -454,9 +481,18 @@ app.patch('/api/ops/issues/:id', requireAuth, async (req, res) => {
     if (!scope.hubs.includes(issue.hub)) {
       return res.status(403).json({ error: 'This issue is outside your assigned hubs.' });
     }
+    // Any response restarts this level's escalation clock. Resolving clears
+    // the flag outright; otherwise leave response_status/escalation_level as
+    // they are (a reply doesn't demote a Critical issue back to Regular —
+    // only the ladder job below advances it, and only on silence).
+    const responseStatus = status === 'Resolved' ? 'Resolved' : null;
     await db.execute({
-      sql: `UPDATE issues SET status = ?, remarks = ?, remarks_by = ?, updated_at = ? WHERE id = ?`,
-      args: [status, remarks || null, req.user, new Date().toISOString(), req.params.id]
+      sql: `UPDATE issues SET status = ?, remarks = ?, remarks_by = ?, updated_at = ?, level_started_at = ?
+            ${responseStatus ? ', response_status = ?' : ''}
+            WHERE id = ?`,
+      args: responseStatus
+        ? [status, remarks || null, req.user, new Date().toISOString(), new Date().toISOString(), responseStatus, req.params.id]
+        : [status, remarks || null, req.user, new Date().toISOString(), new Date().toISOString(), req.params.id]
     });
     res.json({ ok: true });
   } catch (err) {
@@ -702,6 +738,67 @@ if (String(DAILY_REPORT_ENABLED).toLowerCase() === 'true') {
   }, { timezone: DAILY_REPORT_TZ });
   console.log(`Daily pending-issues report scheduled: "${DAILY_REPORT_CRON}" (${DAILY_REPORT_TZ}).`);
 }
+
+// ---------- time-based escalation ladder ----------
+// L3 (Hub) -> 2h silence -> L2 (Cluster Lead / Regional Manager) -> 2h silence
+// -> L1 (Ops Manager) -> 1h silence -> stays L1, flagged Very Critical.
+// "Silence" = no PATCH to the issue since level_started_at, which every ops
+// response resets (see /api/ops/issues/:id). Resolved issues are skipped.
+const ESCALATION_RULES = [
+  { level: 'L3', hours: 2, nextLevel: 'L2', nextStatus: 'Need attention' },
+  { level: 'L2', hours: 2, nextLevel: 'L1', nextStatus: 'Critical' },
+  { level: 'L1', hours: 1, nextLevel: 'L1', nextStatus: 'Very critical' }
+];
+
+async function runEscalationSweep() {
+  const result = await db.execute({
+    sql: `SELECT id, escalation_level, response_status, level_started_at
+          FROM issues
+          WHERE status != 'Resolved' AND (response_status IS NULL OR response_status != 'Very critical')`
+  });
+  const now = Date.now();
+  let escalated = 0;
+  for (const issue of result.rows) {
+    const rule = ESCALATION_RULES.find(r => r.level === (issue.escalation_level || 'L3'));
+    if (!rule) continue;
+    // L1's own rule can re-fire (Critical -> Very critical at the same
+    // level); every other rule only fires once per level since nextLevel
+    // differs from level, moving the row out of that rule's own match.
+    if (rule.level === 'L1' && issue.response_status === 'Very critical') continue;
+    const started = issue.level_started_at ? new Date(issue.level_started_at).getTime() : null;
+    if (!started) continue;
+    const hoursSince = (now - started) / (60 * 60 * 1000);
+    if (hoursSince < rule.hours) continue;
+    await db.execute({
+      sql: `UPDATE issues SET escalation_level = ?, response_status = ?, level_started_at = ? WHERE id = ?`,
+      args: [rule.nextLevel, rule.nextStatus, new Date().toISOString(), issue.id]
+    });
+    escalated++;
+  }
+  if (escalated) console.log(`Escalation sweep: advanced ${escalated} issue(s).`);
+  return { checked: result.rows.length, escalated };
+}
+
+cron.schedule('*/10 * * * *', () => {
+  runEscalationSweep().catch(err => console.error('Escalation sweep failed:', err));
+});
+console.log('Escalation ladder sweep scheduled: every 10 minutes.');
+
+// Manual trigger, same reasoning as /api/admin/send-daily-report: lets an
+// external cron service (Render Cron Job, cron-job.org) drive this instead
+// of relying on node-cron staying resident if the service can spin down.
+app.post('/api/admin/run-escalation-sweep', async (req, res) => {
+  if (req.headers['x-setup-key'] !== SETUP_KEY) {
+    return res.status(403).json({ error: 'Invalid setup key.' });
+  }
+  try {
+    const result = await runEscalationSweep();
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Escalation sweep failed.' });
+  }
+});
 
 // Manual trigger for testing, or for an external cron service (e.g. a Render
 // Cron Job, or cron-job.org) to hit instead of relying on node-cron staying
