@@ -762,19 +762,35 @@ async function runEscalationSweep() {
   const failures = [];
   for (const issue of result.rows) {
     try {
-      const rule = ESCALATION_RULES.find(r => r.level === (issue.escalation_level || 'L3'));
-      if (!rule) continue;
-      // L1's own rule can re-fire (Critical -> Very critical at the same
-      // level); every other rule only fires once per level since nextLevel
-      // differs from level, moving the row out of that rule's own match.
-      if (rule.level === 'L1' && issue.response_status === 'Very critical') continue;
-      const started = issue.level_started_at ? new Date(issue.level_started_at).getTime() : null;
+      let level = issue.escalation_level || 'L3';
+      let status = issue.response_status || 'Regular';
+      let started = issue.level_started_at ? new Date(issue.level_started_at).getTime() : null;
       if (!started || Number.isNaN(started)) continue;
-      const hoursSince = (now - started) / (60 * 60 * 1000);
-      if (hoursSince < rule.hours) continue;
+      let advanced = false;
+      // Walk every level this issue has actually earned in one pass — e.g. an
+      // issue that's sat for 3 days should land on "Very critical" in a
+      // single sweep, not crawl up one level per 10-minute run. Each step
+      // consumes only its own window (started += rule.hours) rather than
+      // resetting to "now", so the remaining backlog still counts toward the
+      // next level.
+      while (true) {
+        const rule = ESCALATION_RULES.find(r => r.level === level);
+        if (!rule) break;
+        // L1's own rule can re-fire (Critical -> Very critical at the same
+        // level); every other rule only fires once per level since nextLevel
+        // differs from level, moving the row out of that rule's own match.
+        if (rule.level === 'L1' && status === 'Very critical') break;
+        const hoursSince = (now - started) / (60 * 60 * 1000);
+        if (hoursSince < rule.hours) break;
+        started += rule.hours * 60 * 60 * 1000;
+        level = rule.nextLevel;
+        status = rule.nextStatus;
+        advanced = true;
+      }
+      if (!advanced) continue;
       await db.execute({
         sql: `UPDATE issues SET escalation_level = ?, response_status = ?, level_started_at = ? WHERE id = ?`,
-        args: [rule.nextLevel, rule.nextStatus, new Date().toISOString(), issue.id]
+        args: [level, status, new Date(started).toISOString(), issue.id]
       });
       escalated++;
     } catch (err) {
