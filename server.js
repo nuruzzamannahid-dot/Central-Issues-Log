@@ -754,7 +754,8 @@ async function runEscalationSweep() {
   const result = await db.execute({
     sql: `SELECT id, escalation_level, response_status, level_started_at
           FROM issues
-          WHERE status != 'Resolved' AND (response_status IS NULL OR response_status != 'Very critical')`
+          WHERE status != 'Resolved' AND (response_status IS NULL OR response_status != 'Very critical')`,
+    args: []
   });
   const now = Date.now();
   let escalated = 0;
