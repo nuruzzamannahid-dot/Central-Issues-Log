@@ -758,25 +758,32 @@ async function runEscalationSweep() {
   });
   const now = Date.now();
   let escalated = 0;
+  const failures = [];
   for (const issue of result.rows) {
-    const rule = ESCALATION_RULES.find(r => r.level === (issue.escalation_level || 'L3'));
-    if (!rule) continue;
-    // L1's own rule can re-fire (Critical -> Very critical at the same
-    // level); every other rule only fires once per level since nextLevel
-    // differs from level, moving the row out of that rule's own match.
-    if (rule.level === 'L1' && issue.response_status === 'Very critical') continue;
-    const started = issue.level_started_at ? new Date(issue.level_started_at).getTime() : null;
-    if (!started) continue;
-    const hoursSince = (now - started) / (60 * 60 * 1000);
-    if (hoursSince < rule.hours) continue;
-    await db.execute({
-      sql: `UPDATE issues SET escalation_level = ?, response_status = ?, level_started_at = ? WHERE id = ?`,
-      args: [rule.nextLevel, rule.nextStatus, new Date().toISOString(), issue.id]
-    });
-    escalated++;
+    try {
+      const rule = ESCALATION_RULES.find(r => r.level === (issue.escalation_level || 'L3'));
+      if (!rule) continue;
+      // L1's own rule can re-fire (Critical -> Very critical at the same
+      // level); every other rule only fires once per level since nextLevel
+      // differs from level, moving the row out of that rule's own match.
+      if (rule.level === 'L1' && issue.response_status === 'Very critical') continue;
+      const started = issue.level_started_at ? new Date(issue.level_started_at).getTime() : null;
+      if (!started || Number.isNaN(started)) continue;
+      const hoursSince = (now - started) / (60 * 60 * 1000);
+      if (hoursSince < rule.hours) continue;
+      await db.execute({
+        sql: `UPDATE issues SET escalation_level = ?, response_status = ?, level_started_at = ? WHERE id = ?`,
+        args: [rule.nextLevel, rule.nextStatus, new Date().toISOString(), issue.id]
+      });
+      escalated++;
+    } catch (err) {
+      console.error(`Escalation sweep: issue ${issue.id} failed:`, err);
+      failures.push({ id: issue.id, error: err.message });
+    }
   }
   if (escalated) console.log(`Escalation sweep: advanced ${escalated} issue(s).`);
-  return { checked: result.rows.length, escalated };
+  if (failures.length) console.log(`Escalation sweep: ${failures.length} issue(s) failed.`);
+  return { checked: result.rows.length, escalated, failures };
 }
 
 cron.schedule('*/10 * * * *', () => {
@@ -796,7 +803,7 @@ app.post('/api/admin/run-escalation-sweep', async (req, res) => {
     res.json({ ok: true, ...result });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: 'Escalation sweep failed.' });
+    res.status(500).json({ error: 'Escalation sweep failed.', detail: err.message });
   }
 });
 
