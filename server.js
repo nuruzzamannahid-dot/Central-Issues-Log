@@ -115,7 +115,12 @@ async function ensureTables() {
     "ALTER TABLE issues ADD COLUMN escalation_level TEXT DEFAULT 'L3'",
     "ALTER TABLE issues ADD COLUMN response_status TEXT DEFAULT 'Regular'",
     'ALTER TABLE issues ADD COLUMN level_started_at TEXT',
-    'ALTER TABLE issues ADD COLUMN merchant_notified_at TEXT'
+    'ALTER TABLE issues ADD COLUMN merchant_notified_at TEXT',
+    // KAM-side close (separate from the Ops-side status field): did the KAM
+    // confirm the merchant was told before closing, and who/when.
+    'ALTER TABLE issues ADD COLUMN merchant_informed TEXT',
+    'ALTER TABLE issues ADD COLUMN closed_by TEXT',
+    'ALTER TABLE issues ADD COLUMN closed_at TEXT'
   ]) {
     try {
       await db.execute(stmt);
@@ -352,6 +357,44 @@ app.get('/api/issues', requireAuth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Could not fetch issues.' });
+  }
+});
+
+// KAM-side close: only the KAM who originally logged the issue can close it
+// (not anyone else's), only once Ops/Hub has actually left a remark (nothing
+// to confirm yet otherwise), and only with an explicit answer on whether the
+// merchant was told. This is separate from the Ops-side status field the
+// OPS Console PATCHes — either side closing it sets the same `status`
+// column, so it closes for both at once.
+app.patch('/api/issues/:id/close', requireAuth, async (req, res) => {
+  try {
+    const { merchantInformed } = req.body || {};
+    if (merchantInformed !== 'Yes' && merchantInformed !== 'No') {
+      return res.status(400).json({ error: 'merchantInformed must be "Yes" or "No".' });
+    }
+    const existing = await db.execute({ sql: 'SELECT * FROM issues WHERE id = ?', args: [req.params.id] });
+    const issue = existing.rows[0];
+    if (!issue) return res.status(404).json({ error: 'Issue not found.' });
+    if ((issue.logged_by || '').toLowerCase() !== req.user.toLowerCase()) {
+      return res.status(403).json({ error: 'You can only close issues you logged yourself.' });
+    }
+    if (issue.status === 'Resolved') {
+      return res.status(400).json({ error: 'This issue is already closed.' });
+    }
+    if (!issue.remarks) {
+      return res.status(400).json({ error: 'No response on this issue yet — nothing to close.' });
+    }
+    const now = new Date().toISOString();
+    await db.execute({
+      sql: `UPDATE issues
+            SET status = 'Resolved', response_status = 'Resolved', merchant_informed = ?, closed_by = ?, closed_at = ?, updated_at = ?
+            WHERE id = ?`,
+      args: [merchantInformed, req.user, now, now, req.params.id]
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Could not close issue.' });
   }
 });
 
