@@ -363,9 +363,10 @@ app.get('/api/issues', requireAuth, async (req, res) => {
 // KAM-side close: only the KAM who originally logged the issue can close it
 // (not anyone else's), only once Ops/Hub has actually left a remark (nothing
 // to confirm yet otherwise), and only with an explicit answer on whether the
-// merchant was told. This is separate from the Ops-side status field the
-// OPS Console PATCHes — either side closing it sets the same `status`
-// column, so it closes for both at once.
+// merchant was told. This is the KAM's own confirmation that the issue is
+// truly closed, separate from (and available even after) Ops marking status
+// Resolved on their side — a KAM can only confirm once (closed_by guards
+// that), but Ops resolving first doesn't block it.
 app.patch('/api/issues/:id/close', requireAuth, async (req, res) => {
   try {
     const { merchantInformed } = req.body || {};
@@ -378,8 +379,8 @@ app.patch('/api/issues/:id/close', requireAuth, async (req, res) => {
     if ((issue.logged_by || '').toLowerCase() !== req.user.toLowerCase()) {
       return res.status(403).json({ error: 'You can only close issues you logged yourself.' });
     }
-    if (issue.status === 'Resolved') {
-      return res.status(400).json({ error: 'This issue is already closed.' });
+    if (issue.closed_by) {
+      return res.status(400).json({ error: 'You already confirmed this issue as closed.' });
     }
     if (!issue.remarks) {
       return res.status(400).json({ error: 'No response on this issue yet — nothing to close.' });
