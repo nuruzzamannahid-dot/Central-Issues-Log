@@ -824,6 +824,32 @@ app.post('/api/admin/run-escalation-sweep', async (req, res) => {
   }
 });
 
+// ONE-TIME repair for the earlier single-step sweep bug: any open issue that
+// has never actually been touched by a person (updated_at IS NULL) had its
+// level_started_at reset to whatever moment the old buggy sweep happened to
+// run, instead of reflecting how long it's genuinely been open. For any such
+// issue, the true state is just a function of its original `ts`, so this
+// resets it back to L3/Regular/ts and immediately re-runs the (now-fixed)
+// cascading sweep to recompute where it actually belongs. Safe to run once;
+// harmless to run again later since it only touches never-touched issues.
+app.post('/api/admin/resync-escalation', async (req, res) => {
+  if (req.headers['x-setup-key'] !== SETUP_KEY) {
+    return res.status(403).json({ error: 'Invalid setup key.' });
+  }
+  try {
+    const reset = await db.execute({
+      sql: `UPDATE issues SET escalation_level = 'L3', response_status = 'Regular', level_started_at = ts
+            WHERE status != 'Resolved' AND updated_at IS NULL`,
+      args: []
+    });
+    const result = await runEscalationSweep();
+    res.json({ ok: true, reset: reset.rowsAffected, ...result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Resync failed.', detail: err.message });
+  }
+});
+
 // Manual trigger for testing, or for an external cron service (e.g. a Render
 // Cron Job, or cron-job.org) to hit instead of relying on node-cron staying
 // resident — useful if this service can spin down on an inactivity timeout.
